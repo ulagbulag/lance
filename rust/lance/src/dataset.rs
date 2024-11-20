@@ -7,6 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
+use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -16,6 +17,7 @@ use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::projection::ProjectionPlan;
+use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -428,7 +430,7 @@ impl Dataset {
         })
     }
 
-    /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
+    /// Write to or Create a [Dataset] with an iterator of [RecordBatch]s.
     ///
     /// `dest` can be a `&str`, `object_store::path::Path` or `Arc<Dataset>`.
     ///
@@ -440,19 +442,51 @@ impl Dataset {
         dest: impl Into<WriteDestination<'_>>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
+        Self::write_stream(stream, schema, dest, params).await
+    }
+
+    /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
+    ///
+    /// `dest` can be a `&str`, `object_store::path::Path` or `Arc<Dataset>`.
+    ///
+    /// Returns the newly created [`Dataset`].
+    /// Or Returns [Error] if the dataset already exists.
+    ///
+    pub async fn write_stream(
+        stream: SendableRecordBatchStream,
+        schema: Schema,
+        dest: impl Into<WriteDestination<'_>>,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
         let mut builder = InsertBuilder::new(dest);
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        builder.execute_stream(batches).await
+        builder.execute_stream(stream, schema).await
     }
 
-    /// Append to existing [Dataset] with a stream of [RecordBatch]s
+    /// Append to existing [Dataset] with an iterator of [RecordBatch]s
     ///
     /// Returns void result or Returns [Error]
     pub async fn append(
         &mut self,
         batches: impl RecordBatchReader + Send + 'static,
+        params: Option<WriteParams>,
+    ) -> Result<()> {
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
+        self.append_stream(stream, schema, params).await
+    }
+
+    /// Append to existing [Dataset] with a stream of [RecordBatch]s
+    ///
+    /// Returns void result or Returns [Error]
+    pub async fn append_stream(
+        &mut self,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
         params: Option<WriteParams>,
     ) -> Result<()> {
         let write_params = WriteParams {
@@ -462,7 +496,7 @@ impl Dataset {
 
         let new_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
             .with_params(&write_params)
-            .execute_stream(batches)
+            .execute_stream(stream, schema)
             .await?;
 
         *self = new_dataset;

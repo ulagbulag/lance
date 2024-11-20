@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::RecordBatchReader;
+use datafusion::execution::SendableRecordBatchStream;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
@@ -71,24 +72,29 @@ impl<'a> InsertBuilder<'a> {
         Self::do_commit(&context, transaction).await
     }
 
+    /// Execute the insert operation with the given reader.
+    ///
+    /// This writes the data fragments and commits them into the dataset.
+    pub async fn execute_reader(
+        &self,
+        reader: impl RecordBatchReader + Send + 'static,
+    ) -> Result<Dataset> {
+        // Box it so we don't monomorphize for every one. We take the generic
+        // parameter for API ergonomics.
+        let (batches, schema) = peek_reader_schema(Box::new(reader)).await?;
+        let stream = reader_to_stream(batches);
+        self.execute_stream(stream, schema).await
+    }
+
     /// Execute the insert operation with the given stream.
     ///
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute_stream(
         &self,
-        stream: impl RecordBatchReader + Send + 'static,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
     ) -> Result<Dataset> {
-        // Box it so we don't monomorphize for every one. We take the generic
-        // parameter for API ergonomics.
-        let stream = Box::new(stream);
-        self.execute_stream_impl(stream).await
-    }
-
-    async fn execute_stream_impl(
-        &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
-    ) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_stream_impl(stream).await?;
+        let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Self::do_commit(&context, transaction).await
     }
 
@@ -161,30 +167,43 @@ impl<'a> InsertBuilder<'a> {
                 });
             }
         }
-        let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
-        self.write_uncommitted_stream_impl(Box::new(reader)).await
+        let batches = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
+        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
+        let stream = reader_to_stream(batches);
+        self.write_uncommitted_stream_impl(stream, schema).await
     }
 
     /// Write data files, but don't commit the transaction yet.
     ///
     /// Use [`CommitBuilder`] to commit the transaction.
+    pub async fn execute_uncommitted_reader(
+        &self,
+        reader: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Result<Transaction> {
+        let (batches, schema) = peek_reader_schema(reader).await?;
+        let stream = reader_to_stream(batches);
+        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        Ok(transaction)
+    }
+
+    /// Write data stream, but don't commit the transaction yet.
+    ///
+    /// Use [`CommitBuilder`] to commit the transaction.
     pub async fn execute_uncommitted_stream(
         &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
     ) -> Result<Transaction> {
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream).await?;
+        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Ok(transaction)
     }
 
     async fn write_uncommitted_stream_impl(
         &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
-
-        let (batches, schema) = peek_reader_schema(stream).await?;
-        let stream = reader_to_stream(batches);
-
         self.validate_write(&mut context, &schema)?;
 
         let written_frags = write_fragments_internal(

@@ -9,6 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
@@ -221,9 +222,12 @@ pub async fn write_fragments(
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
 ) -> Result<Transaction> {
+    let (batches, schema) = peek_reader_schema(Box::new(data)).await?;
+    let stream = reader_to_stream(batches);
+
     InsertBuilder::new(dest.into())
         .with_params(&params)
-        .execute_uncommitted_stream(Box::new(data))
+        .execute_uncommitted_stream(stream, schema)
         .await
 }
 

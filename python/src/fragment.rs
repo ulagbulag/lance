@@ -482,7 +482,7 @@ pub fn write_fragments(
             Some(reader.py()),
             InsertBuilder::new(dest)
                 .with_params(&params)
-                .execute_uncommitted_stream(batches),
+                .execute_uncommitted_reader(batches),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
